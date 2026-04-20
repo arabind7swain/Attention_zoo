@@ -161,3 +161,56 @@ class  GroupedQueryAttention(Attention):
         Z_s = torch.cat([head(x, mask) for head in self.grouped], dim=2)
         Z = self.proj(Z_s)
         return Z
+    
+class CausalSelfAttentionIHA(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.head_dim = self.n_embd // self.n_head
+        assert self.n_embd % self.n_head == 0
+        
+        # Standard Linear Projections
+        self.c_q = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.c_k = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.c_v = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        
+        # Inter-Head Mixing Matrices (Learnable parameters)
+        # Initialized to zeros; the network will learn how to route info between heads
+        self.q_mix = nn.Parameter(torch.zeros(self.n_head, self.n_head))
+        self.k_mix = nn.Parameter(torch.zeros(self.n_head, self.n_head))
+        self.v_mix = nn.Parameter(torch.zeros(self.n_head, self.n_head))
+
+    def _fuse_mix(self, weight, mix):
+        """
+        Dynamically folds the cross-head mixing matrix into the linear projection weights.
+        weight shape: (n_embd, n_embd) -> reshaped to (n_head, head_dim * n_embd)
+        mix shape: (n_head, n_head)
+        """
+        d = self.head_dim
+        H = self.n_head
+        # Matrix multiplication applies the cross-head mixing to the projection weights
+        return (mix @ weight.view(H, d, -1).flatten(1)).view_as(weight)
+
+    def forward(self, x):
+        B, T, C = x.size()
+        
+        # 1. Fuse mixing matrices with projection weights on the fly
+        q_weight = self._fuse_mix(self.c_q.weight, self.q_mix)
+        k_weight = self._fuse_mix(self.c_k.weight, self.k_mix)
+        v_weight = self._fuse_mix(self.c_v.weight, self.v_mix)
+        
+        # 2. Project inputs using the fused weights
+        # Reshape to (B, T, H, D) then transpose to (B, H, T, D) for attention
+        q = F.linear(x, q_weight).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        k = F.linear(x, k_weight).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        v = F.linear(x, v_weight).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        
+        # 3. Standard Causal Attention
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        
+        # 4. Reassemble and project output
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        return self.c_proj(y)
+
