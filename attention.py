@@ -371,3 +371,90 @@ class CausalSelfAttentionIHA(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.c_proj(y)
 
+class MultiHeadLatentAttention(nn.Module):
+    """
+    Multi-Head Latent Attention (MLA) - Naive implementation.
+
+    Compresses both Q and KV representations into low-dimensional latent spaces.
+    During decoding, only the compressed KV latent is cached.
+    Expands latent to full K, V before attention computation.
+
+    Query compression: x -> W_dq -> RMSNorm -> W_uq -> Q  (not cached)
+    KV compression:    x -> W_dkv -> L_kv (cached) -> W_uk/W_uv -> K, V
+
+    KV cache size per token: d_c (vs 2 * n_heads * d_h for standard MHA)
+    """
+    def __init__(self, d_model, n_heads, d_c, d_cq, max_seq_len=4096):
+        super().__init__()
+        self.n_heads = n_heads
+        self.d_h = d_model // n_heads
+        self.d_c = d_c
+        self.d_cq = d_cq
+        self.max_seq_len = max_seq_len
+
+        # Query compression: down-project, normalize, up-project
+        self.W_dq = nn.Linear(d_model, d_cq, bias=False)
+        self.q_norm = RMSNorm(d_cq)
+        self.W_uq = nn.Linear(d_cq, n_heads * self.d_h, bias=False)
+
+        # KV compression
+        self.W_dkv = nn.Linear(d_model, d_c, bias=False)
+        self.W_uk = nn.Linear(d_c, n_heads * self.d_h, bias=False)
+        self.W_uv = nn.Linear(d_c, n_heads * self.d_h, bias=False)
+
+        self.W_o = nn.Linear(n_heads * self.d_h, d_model, bias=False)
+
+        # Pre-allocated latent cache
+        # Note: batch dim=1 for simplicity; for batched inference, parameterize with max_batch_size
+        self.register_buffer('latent_cache', torch.zeros(1, max_seq_len, d_c))
+        self.cache_position = 0
+
+    def forward(self, x, use_cache=False):
+        B, N, _ = x.shape
+
+        # Query: down-project -> normalize -> up-project
+        L_q = self.q_norm(self.W_dq(x))
+        Q = self.W_uq(L_q).view(B, N, self.n_heads, self.d_h).transpose(1, 2)
+
+        # KV: compress to latent
+        L_kv = self.W_dkv(x)
+
+        if use_cache:
+            start = self.cache_position
+            end = start + N
+            self.latent_cache[:B, start:end, :] = L_kv
+            self.cache_position = end
+            L_kv = self.latent_cache[:B, :end, :]
+
+        # Expand latent to full K, V (on-the-fly, not cached)
+        K = self.W_uk(L_kv).view(B, -1, self.n_heads, self.d_h).transpose(1, 2)
+        V = self.W_uv(L_kv).view(B, -1, self.n_heads, self.d_h).transpose(1, 2)
+
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_h)
+
+        # Apply causal mask during prefill (seq_len > 1)
+        if N > 1:
+            cache_len = K.size(2)
+            causal_mask = torch.triu(
+                torch.ones(N, cache_len, device=x.device, dtype=torch.bool),
+                diagonal=cache_len - N + 1
+            )
+            scores = scores.masked_fill(causal_mask, float('-inf'))
+
+        attn = F.softmax(scores, dim=-1)
+        out = torch.matmul(attn, V)
+
+        out = out.transpose(1, 2).contiguous().view(B, N, -1)
+        return self.W_o(out)
+
+    def reset_cache(self):
+        self.latent_cache.zero_()
+        self.cache_position = 0
+
+    def cache_size_bytes(self):
+        if self.cache_position == 0:
+            return 0
+        return self.cache_position * self.d_c * self.latent_cache.element_size()
+
+    def cache_size_per_token(self):
+        return self.d_c
